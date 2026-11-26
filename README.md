@@ -1,9 +1,9 @@
-# VIctory
+# <span style="color:#ff2222">XMS</span>
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
 the user supplies.
 
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
+The title's x86-64 code runs unchanged inside our process; <span style="color:#ff2222">XMS</span> supplies
 the platform underneath it and converts the title's data, ahead of time where
 it can (shaders and pipelines too, see Getting started) and on first use
 otherwise. See [docs/architecture.md](docs/architecture.md).
@@ -14,7 +14,7 @@ otherwise. See [docs/architecture.md](docs/architecture.md).
 world.** Nothing else keeps the game from working: the title boots, runs its
 menus at its own 30 fps, loads the world, plays the intro cutscene and
 reaches the **prologue**, the mission after it, with the graphics fully
-displayed. 
+displayed.
 
 | Stage | State |
 |-------|-------|
@@ -34,7 +34,7 @@ Tested on one machine: Windows 11, AMD RX 6700 XT (12 GB).
 > and Windows then reset the display driver (every monitor goes black for a
 > moment). The latest runs, several minutes each in the world, did not, but
 > it is not ruled out; a run can also end on a GPU fault (`crashes.log`). A
-> diagnostics build with `VICTORY_D3D12_WARP=1` renders on the software
+> diagnostics build with `<span style="color:#ff2222">XMS</span>_D3D12_WARP=1` renders on the software
 > adapter instead (too slow to reach the world in minutes).
 
 What each part does today and what it still needs:
@@ -51,7 +51,7 @@ What each part does today and what it still needs:
 | GPU: world | The scene is drawn and presented: mesh pipelines, indirect execution, views the shaders pick from the heap themselves, title memory read by address, depth written from compute, lists that wait for values other queues write, textures made when a shader first reads them, pipelines pre-built or made by worker threads and kept on disk, depth bounds on supporting adapters (synthetic tests) | The title's ray-tracing structures are never built (no ray-traced shadows or indirect light in the intro cutscene); about 1 s a frame; draws of untranslated shaders are dropped; real queries, HDR and scaling are missing |
 | Shaders | Console GPU code recompiled to DXIL, ahead of time (`translate --cache`) or at first use, cached on disk. Menus: all. World: all but under 300 of 24,387 programs | Merged geometry stages (195 programs) and under 100 others; fused multiply-adds follow the host GPU; some compute programs need a GPU with 64-lane waves |
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
-| Series S mode | Menus, loading and the world run with the PC upscaler (`VICTORY_FIDELITYFX_DIR`, about 1 s a frame) | The title's own upscaler DLLs: six of their passes are untranslated, so their picture is wrong |
+| Series S mode | Menus, loading and the world run with the PC upscaler (`<span style="color:#ff2222">XMS</span>_FIDELITYFX_DIR`, about 1 s a frame) | The title's own upscaler DLLs: six of their passes are untranslated, so their picture is wrong |
 
 ## Getting started
 
@@ -69,7 +69,7 @@ Keep the build paths short. From a checkout about 170 characters deep, the
 `blake3` dependency's build script fails in `ml64.exe` with
 `A1009: line too long`, even with long paths enabled in Windows, because
 its object files land under `target`. Set `CARGO_TARGET_DIR` to a short
-absolute path (`$env:CARGO_TARGET_DIR = 'C:\vt'`; `victory.exe` is then
+absolute path (`$env:CARGO_TARGET_DIR = 'C:\vt'`; `<span style="color:#ff2222">xms</span>.exe` is then
 in `C:\vt\release` instead of `target\release`), or check out the
 repository nearer the drive's root.
 
@@ -81,17 +81,17 @@ other applications or increase the Windows paging file size, then retry.
 
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
-copy victory.example.toml victory.toml   # then set your paths (outside the repo)
+copy xms.example.toml xms.toml          # then set your paths (outside the repo)
 cargo test --workspace                   # needs no game data
-cargo run -p victory -- config           # check your paths
+cargo run -p xms -- config              # check your paths
 ```
 
 Run the title:
 
 ```powershell
-cargo build --release -p victory
-target\release\victory.exe translate --cache --pipelines <game dir>\shaders.rpf <game dir>\<the title's exe> <game dir>\XboxBvhBuilder.dll <game dir>\amd_fidelityfx_upscaler_xbox.dll
-target\release\victory.exe run <game dir>\<the title's exe> --execute
+cargo build --release -p xms
+target\release\xms.exe translate --cache --pipelines <game dir>\shaders.rpf <game dir>\<the title's exe> <game dir>\XboxBvhBuilder.dll <game dir>\amd_fidelityfx_upscaler_xbox.dll
+target\release\xms.exe run <game dir>\<the title's exe> --execute
 ```
 
 The `translate --cache` step (minutes; again after a change of the shader
@@ -115,16 +115,16 @@ plays, then the prologue starts.
 Upscaling (Series S mode): the title upscales with AMD FidelityFX. To run
 it with the PC build on your GPU instead of the console build, get the
 [FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
-and point `VICTORY_FIDELITYFX_DIR` (or `[paths].fidelityfx_dir`) at its
+and point `<span style="color:#ff2222">XMS</span>_FIDELITYFX_DIR` (or `[paths].fidelityfx_dir`) at its
 `Kits/FidelityFX/signedbin` folder, which holds
 `amd_fidelityfx_upscaler_dx12.dll`. Without it, or if that DLL offers no
 upscaler for your GPU (the log says so), the title's own DLLs run.
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
-are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
+are kept under the data folder (default `%LOCALAPPDATA%\<span style="color:#ff2222">xms</span>\data`), derived
 data under the cache folder.
 
-Set `VICTORY_WINDOW_MAX=1920x1080` before launching to limit the title's
+Set `<span style="color:#ff2222">XMS</span>_WINDOW_MAX=1920x1080` before launching to limit the title's
 top-level window to that bounding box. Smaller windows keep their size,
 larger windows keep their proportions, and the monitor's work area still
 limits them. This scales the displayed image; it does not change the
@@ -146,21 +146,21 @@ title's window has focus:
 ## Commands
 
 ```
-victory inspect <exe|dll> [--imports] [--exports]
-victory census [paths...] [--missing] [--strict]
-victory lib-exports <import.lib> [--list]
-victory shader-info [paths...] [--verbose] [--disasm] [--effects]
-victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-victory translate [paths...] --cache [--pipelines] [--jobs N]
-victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
-            [--console series-x|series-s] [-- <title arguments>]
-victory config
+xms inspect <exe|dll> [--imports] [--exports]
+xms census [paths...] [--missing] [--strict]
+xms lib-exports <import.lib> [--list]
+xms shader-info [paths...] [--verbose] [--disasm] [--effects]
+xms translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
+xms translate [paths...] --cache [--pipelines] [--jobs N]
+xms run <exe> [--execute] [--unimplemented trap|zero] [--strict]
+        [--console series-x|series-s] [-- <title arguments>]
+xms config
 ```
 
 `translate --jobs N` requires a positive worker count. Omit it to use the
 default worker count.
 
-Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
+Logging: `<span style="color:#ff2222">XMS</span>_LOG=xms_loader=trace,info` (a release build logs
 info and above).
 
 ### Windows shader-test validator
@@ -172,8 +172,8 @@ from [Microsoft's DirectX Shader Compiler releases](https://github.com/microsoft
 or a current Windows SDK. Set its path for the test session:
 
 ```powershell
-$env:VICTORY_DXIL = 'C:\tools\dxc\bin\x64\dxil.dll'
-cargo test -p victory-shader --lib --locked -- --test-threads=1
+$env:XMS_DXIL = 'C:\tools\dxc\bin\x64\dxil.dll'
+cargo test -p xms-shader --lib --locked -- --test-threads=1
 ```
 
 Without this override, the validator loader selects the newest installed
@@ -186,57 +186,50 @@ the translated shaders do not require it at runtime.
 A release build has no debugging aids. Build them in with
 
 ```powershell
-cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
+cargo build --profile diag -p xms --features diagnostics   # target\diag\xms.exe
 ```
 
 The on/off switches below (`...=1`) are off when unset or set to `0`.
 
 | Variable | Effect |
 |----------|--------|
-| `VICTORY_LOG=<target>=debug,...` | debug and trace output |
-| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
-| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
-| `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
-| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
-| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_CAPTURE_WORLD=<list>` | with `VICTORY_CAPTURE`, also saves (and with `VICTORY_DUMP_TARGETS` dumps) the frames at these offsets from the first frame that ran 500 draws (the world's first; its number depends on how fast the title loaded) |
-| `VICTORY_DUMP_WRITERS=<hash>,...` | with the two above, also the textures a pipeline containing a listed shader hash writes, the first frame it runs, and for its buffers a log line (dwords changed, dwords not zero) |
-| `VICTORY_PEEK=<hex address>[:<bytes>],...` | in listed frames, those bytes of title memory logged after each submission. Listed frames also log targets of 16 texels or fewer as values, each table view's view words and whether its host slot is null, the host copy of every buffer of 64 bytes or fewer a draw reads (at submission and after its list), and each 1D or 3D texture a dispatch writes, read back right after it |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
-| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | skip host pipeline creation and omit draws and dispatches, including indirect ones, when the pipeline contains a listed 16-digit shader hash |
-| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands; a device removal names the list it happened in and lists all its commands |
-| `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500, and all of them in listed capture frames); the records of its indirect executions are read back and logged in every frame (records with work, the first four, the frame) |
-| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |
-| `VICTORY_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` makes nothing and lists each pack record's key, shaders and state (or why it is skipped) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
-| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
-| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+| `<span style="color:#ff2222">XMS</span>_LOG=<target>=debug,...` | debug and trace output |
+| `<span style="color:#ff2222">XMS</span>_STACKS=20,60` | every thread's stack at those seconds |
+| `<span style="color:#ff2222">XMS</span>_WATCH=<rva>,...` | logs a title u32 when it changes |
+| `<span style="color:#ff2222">XMS</span>_POKE=<rva>:<byte>,...` | writes a title byte twice a second |
+| `<span style="color:#ff2222">XMS</span>_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `<span style="color:#ff2222">XMS</span>_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log` |
+| `<span style="color:#ff2222">XMS</span>_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
+| `<span style="color:#ff2222">XMS</span>_CAPTURE=<dir>` | saves presented frames |
+| `<span style="color:#ff2222">XMS</span>_DUMP_TARGETS=1` | with the two above, saves every render target |
+| `<span style="color:#ff2222">XMS</span>_CAPTURE_WORLD=<list>` | with `XMS_CAPTURE`, also saves world frames |
+| `<span style="color:#ff2222">XMS</span>_DUMP_WRITERS=<hash>,...` | with the two above, textures a pipeline writes |
+| `<span style="color:#ff2222">XMS</span>_PEEK=<hex address>[:<bytes>],...` | in listed frames, those bytes of title memory logged |
+| `<span style="color:#ff2222">XMS</span>_D3D12_DEBUG=1` | host debug layer |
+| `<span style="color:#ff2222">XMS</span>_D3D12_GBV=1` | with the above, GPU-based validation |
+| `<span style="color:#ff2222">XMS</span>_D3D12_DRED=1` | on a GPU failure, the allocation hit and commands in flight |
+| `<span style="color:#ff2222">XMS</span>_SKIP_PIPELINES=<hash>,...` | skip host pipeline creation for listed shader hashes |
+| `<span style="color:#ff2222">XMS</span>_GPU_TIMING=1` | each list run and timed; slow lists logged with slowest commands |
+| `<span style="color:#ff2222">XMS</span>_TRACE_SHADERS=<hash>,...` | every draw and dispatch of listed shaders logged |
+| `<span style="color:#ff2222">XMS</span>_D3D12_WARP=1` | host device on software adapter (slow) |
+| `<span style="color:#ff2222">XMS</span>_PIPELINE_LOG=<file>` | a line per title pipeline created, used, made or loaded |
+| `<span style="color:#ff2222">XMS</span>_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` lists each pack record |
+| `<span style="color:#ff2222">XMS</span>_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane |
+| `<span style="color:#ff2222">XMS</span>_AUDIO_CAPTURE=<file.wav>` | records what the title plays |
+| `<span style="color:#ff2222">XMS</span>_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
 Every build appends unhandled exceptions, panics, and host GPU failures to
 `crashes.log` in the title's data folder.
 
 For a startup breakpoint (`0x80000003`), run the diagnostics build with
-`VICTORY_CRASH_BREAKPOINTS=1`. Keep the console output along with the new
+`<span style="color:#ff2222">XMS</span>_CRASH_BREAKPOINTS=1`. Keep the console output along with the new
 `crashes.log` entries. A host DLL refusal includes the caller stack in the
-console output. The refusal is expected for DLLs outside the host policy,
-including `rpcrt4.dll`.
+console output.
 
 On Series 1.0.2.1, a missing `appdata0.rpf` reproduced the breakpoint at
 `+0x2237178` before the first window. Restore the archive from the same
 package beside the title executable. `run --execute` checks that it can
 read the RPF9 header before starting this build.
-
-To compare hardware and software rendering, repeat with
-`VICTORY_D3D12_WARP=1` and check the console for
-`host device on the software adapter (WARP)` to confirm the WARP device was
-created. Compare the exception's module and offset, stack frames, and
-preceding messages across the two runs.
 
 ## License
 
