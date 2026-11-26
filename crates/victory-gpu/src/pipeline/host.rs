@@ -5,14 +5,15 @@
 //! user data, root views for the title's root views, static samplers for
 //! the immediate samplers, and directly indexed heaps.
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use victory_shader::emit::{MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
+use windows::Win32::Graphics::Direct3D::{Fxc::D3DCompile, ID3DBlob};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::core::{Interface, PCSTR};
+use windows::core::{Interface, PCSTR, s};
 
 use super::{Shader, Translated};
 use crate::host::host;
@@ -384,6 +385,12 @@ pub(crate) struct HostPipeline {
     pub(crate) marks: Option<(u32, u32)>,
 }
 
+// SAFETY: D3D12 pipeline states and root signatures are free-threaded, and
+// `stages` / `inputs` are immutable after construction.
+unsafe impl Send for HostPipeline {}
+// SAFETY: as above.
+unsafe impl Sync for HostPipeline {}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
@@ -453,6 +460,18 @@ impl HostPipeline {
         if atomics64 && !host.heap_atomics64() {
             return refuse(
                 "the host GPU has no 64-bit atomics on typed heap resources",
+                shaders,
+            );
+        }
+        let (_, host_max_lanes) = host.wave_lanes();
+        let needs_wider_wave = stages.iter().any(|(s, _)| {
+            s.translated()
+                .and_then(|t| required_min_wave_lanes(&t.host.dxil))
+                .is_some_and(|min| min > host_max_lanes)
+        });
+        if needs_wider_wave {
+            return refuse(
+                "the host GPU wave size is narrower than the shader's required wave size",
                 shaders,
             );
         }
@@ -791,6 +810,234 @@ impl HostPipeline {
     }
 }
 
+/// Minimum wave lane count declared in a `PSV0` container part.
+fn psv_min_wave_lanes(psv: &[u8]) -> Option<u32> {
+    let info_size = u32::from_le_bytes(psv.get(..4)?.try_into().ok()?) as usize;
+    if info_size < 24 || psv.len() < 4 + info_size {
+        return None;
+    }
+    Some(u32::from_le_bytes(psv[20..24].try_into().ok()?))
+}
+
+fn required_min_wave_lanes(dxil: &[u8]) -> Option<u32> {
+    let c = victory_shader::Container::parse(dxil).ok()?;
+    let psv = c.part(victory_shader::FourCC::PSV0)?.data;
+    psv_min_wave_lanes(psv)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct FallbackGraphicsKey {
+    topology: i32,
+    num_targets: u32,
+    rt_formats: [i32; 8],
+    dsv_format: i32,
+    sample_count: u32,
+    sample_quality: u32,
+}
+
+impl FallbackGraphicsKey {
+    pub(crate) fn from_state(g: &GraphicsState) -> Self {
+        let topology = match host_topology(g) {
+            D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0,
+            other => other.0,
+        };
+        let num_targets = g.targets.NumRenderTargets.min(8);
+        let rt_formats = std::array::from_fn(|i| {
+            if i < num_targets as usize {
+                g.targets.RTFormats[i].0
+            } else {
+                0
+            }
+        });
+        Self {
+            topology,
+            num_targets,
+            rt_formats,
+            dsv_format: g.depth_format.0,
+            sample_count: g.samples.Count.max(1),
+            sample_quality: g.samples.Quality,
+        }
+    }
+}
+
+fn compile_hlsl(source: &[u8], name: PCSTR, entry: PCSTR, target: PCSTR) -> Option<Vec<u8>> {
+    let mut code: Option<ID3DBlob> = None;
+    let mut errors: Option<ID3DBlob> = None;
+    // SAFETY: static HLSL source and valid output blob pointers.
+    let res = unsafe {
+        D3DCompile(
+            source.as_ptr().cast(),
+            source.len(),
+            name,
+            None,
+            None,
+            entry,
+            target,
+            0,
+            0,
+            &mut code,
+            Some(&mut errors),
+        )
+    };
+    if let Err(e) = res {
+        let detail = errors
+            .map(|b| {
+                // SAFETY: `errors` owns its byte buffer.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
+                };
+                String::from_utf8_lossy(bytes).into_owned()
+            })
+            .unwrap_or_default();
+        tracing::warn!(error = %e, detail = %detail.trim(), "fallback shader compile failed");
+        return None;
+    }
+    let code = code?;
+    // SAFETY: `code` owns its byte buffer.
+    Some(unsafe {
+        std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+            .to_vec()
+    })
+}
+
+/// A valid cached no-op compute pipeline, used when a real compute pipeline is
+/// still warming or was refused so no null PSO slot is ever bound.
+pub(crate) fn fallback_compute() -> Option<&'static HostPipeline> {
+    static COMPUTE: OnceLock<Option<HostPipeline>> = OnceLock::new();
+    COMPUTE
+        .get_or_init(|| {
+            let host = host()?;
+            let cs = compile_hlsl(
+                b"[numthreads(1, 1, 1)] void main() {}",
+                s!("victory_noop_cs"),
+                s!("main"),
+                s!("cs_5_0"),
+            )?;
+            let (root, _) = root_signature(&host.device, &[], &[], true).ok()?;
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                // SAFETY: borrowed pointer not released by the description.
+                pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: cs.as_ptr().cast(),
+                    BytecodeLength: cs.len(),
+                },
+                ..Default::default()
+            };
+            // SAFETY: live root signature and shader bytecode.
+            let pso = unsafe { host.device.CreateComputePipelineState(&desc) }.ok()?;
+            crate::host::name(&pso, || "fallback noop compute".into());
+            Some(HostPipeline {
+                compute: true,
+                mesh: false,
+                pso,
+                root,
+                stages: Vec::new(),
+                rectangles: false,
+                slots: 0,
+                inputs: Vec::new(),
+                name: "fallback compute".into(),
+                marks: None,
+            })
+        })
+        .as_ref()
+}
+
+/// A valid cached no-op graphics pipeline matching the render-target, depth,
+/// sample, and topology configuration of `g` (off-screen degenerate VS, zero
+/// color/depth writes).
+pub(crate) fn fallback_graphics(g: &GraphicsState) -> Option<&'static HostPipeline> {
+    static VS: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+    static ROOT: OnceLock<Option<ID3D12RootSignature>> = OnceLock::new();
+    static CACHE: Mutex<Option<HashMap<FallbackGraphicsKey, Option<&'static HostPipeline>>>> =
+        Mutex::new(None);
+
+    let key = FallbackGraphicsKey::from_state(g);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = cache.get_or_insert_with(HashMap::new);
+    if let Some(&cached) = map.get(&key) {
+        return cached;
+    }
+
+    let made = (|| -> Option<&'static HostPipeline> {
+        let host = host()?;
+        let vs = VS
+            .get_or_init(|| {
+                compile_hlsl(
+                    b"float4 main() : SV_Position { return float4(2.0, 2.0, 2.0, 1.0); }",
+                    s!("victory_noop_vs"),
+                    s!("main"),
+                    s!("vs_5_0"),
+                )
+            })
+            .as_ref()?;
+        let root = ROOT
+            .get_or_init(|| root_signature(&host.device, &[], &[], false).ok().map(|r| r.0))
+            .as_ref()?
+            .clone();
+        let mut rt_formats = [DXGI_FORMAT_UNKNOWN; 8];
+        for i in 0..8 {
+            rt_formats[i] = DXGI_FORMAT(key.rt_formats[i]);
+        }
+        let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            // SAFETY: borrowed pointer not released by the description.
+            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+            VS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: vs.as_ptr().cast(),
+                BytecodeLength: vs.len(),
+            },
+            // Zero color writes and no pixel shader; degenerate off-screen VS culls everything.
+            BlendState: D3D12_BLEND_DESC::default(),
+            SampleMask: u32::MAX,
+            RasterizerState: D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE,
+                DepthClipEnable: true.into(),
+                ..Default::default()
+            },
+            DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
+                DepthEnable: false.into(),
+                DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
+                StencilEnable: false.into(),
+                ..Default::default()
+            },
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE(key.topology),
+            NumRenderTargets: key.num_targets,
+            RTVFormats: rt_formats,
+            DSVFormat: DXGI_FORMAT(key.dsv_format),
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: key.sample_count,
+                Quality: key.sample_quality,
+            },
+            ..Default::default()
+        };
+        // SAFETY: live root signature and VS bytecode.
+        let pso = match unsafe { host.device.CreateGraphicsPipelineState(&desc) } {
+            Ok(pso) => pso,
+            Err(e) => {
+                tracing::warn!(error = %e, ?key, "fallback graphics PSO refused");
+                return None;
+            }
+        };
+        crate::host::name(&pso, || "fallback noop graphics".into());
+        let pipeline = Box::leak(Box::new(HostPipeline {
+            compute: false,
+            mesh: false,
+            pso,
+            root,
+            stages: Vec::new(),
+            rectangles: false,
+            slots: 0,
+            inputs: Vec::new(),
+            name: "fallback graphics".into(),
+            marks: None,
+        }));
+        Some(&*pipeline)
+    })();
+
+    map.insert(key, made);
+    made
+}
+
 /// The host's topology type: the console's rectangle and quad types draw
 /// as triangles on the host (see `draw`).
 fn host_topology(g: &GraphicsState) -> D3D12_PRIMITIVE_TOPOLOGY_TYPE {
@@ -1041,5 +1288,31 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    #[test]
+    fn psv0_wave_lane_requirement_is_extracted() {
+        let mut psv = vec![0u8; 4 + 48];
+        psv[..4].copy_from_slice(&48u32.to_le_bytes());
+        psv[20..24].copy_from_slice(&64u32.to_le_bytes());
+        psv[24..28].copy_from_slice(&64u32.to_le_bytes());
+        assert_eq!(psv_min_wave_lanes(&psv), Some(64));
+        assert_eq!(psv_min_wave_lanes(&[0u8; 8]), None);
+    }
+
+    #[test]
+    fn fallback_graphics_key_normalizes_topology_and_targets() {
+        let mut g = GraphicsState::default();
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(RECTANGLES);
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[3] = DXGI_FORMAT_R32_FLOAT;
+        g.samples = DXGI_SAMPLE_DESC { Count: 0, Quality: 0 };
+        let key = FallbackGraphicsKey::from_state(&g);
+        assert_eq!(key.topology, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0);
+        assert_eq!(key.num_targets, 1);
+        assert_eq!(key.rt_formats[0], DXGI_FORMAT_R8G8B8A8_UNORM.0);
+        assert_eq!(key.rt_formats[3], 0);
+        assert_eq!(key.sample_count, 1);
     }
 }

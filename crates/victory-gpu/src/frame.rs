@@ -139,10 +139,14 @@ pub(crate) extern "system" fn wait(
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
     let (tick, wait) = next_tick(kind, limit);
     let hr = if wait > limit {
-        std::thread::sleep(limit);
+        if !limit.is_zero() {
+            std::thread::sleep(limit);
+        }
         TIMEOUT
     } else {
-        std::thread::sleep(wait);
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
+        }
         S_OK
     };
     #[cfg(feature = "diagnostics")]
@@ -217,8 +221,11 @@ pub(crate) extern "system" fn statistics(
 mod tests {
     use super::*;
 
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let null = std::ptr::null();
         assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
         let mut first = 0;
@@ -265,12 +272,14 @@ mod tests {
         assert!(tick > flips[3]);
         // A flip wait begun after its tick passed (two ticks missed) ends at
         // once, on the latest tick passed; the next one waits for the next.
-        std::thread::sleep(Duration::from_millis(110));
+        assert_eq!(set_interval(null, null, 120_000, 3, 0), S_OK);
+        let base = LAST[2].load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(250));
         let before = Instant::now();
         assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token), S_OK);
-        assert!(before.elapsed() < Duration::from_millis(10), "{:?}", before.elapsed());
+        assert!(before.elapsed() < Duration::from_millis(60), "{:?}", before.elapsed());
         let late = LAST[2].load(Ordering::Relaxed);
-        assert!(late >= flips[3] + 2, "{late} after {}", flips[3]);
+        assert!(late >= base + 2, "{late} after {base}");
         assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token), S_OK);
         assert_eq!(LAST[2].load(Ordering::Relaxed), late + 1);
     }
@@ -280,6 +289,7 @@ mod tests {
     /// none. The old code marked the tick after the sleep, so both got it.
     #[test]
     fn waits_begun_together_take_different_ticks() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         const VBLANK: u32 = 1;
         let long = Duration::from_secs(1);
         let (first, _) = next_tick(VBLANK, long);

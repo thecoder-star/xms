@@ -535,8 +535,13 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            return false;
+        let p = match crate::pipeline::host_pipeline(self.pipeline as This) {
+            Some(p) => p,
+            None if !mesh => match crate::pipeline::fallback_pipeline(self.pipeline as This, false) {
+                Some(p) => p,
+                None => return false,
+            },
+            None => return false,
         };
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
@@ -630,6 +635,8 @@ impl State {
             && p.stages.iter().any(|s| s.memory.is_some() || has_root_views(&s.translated().host));
         self.bind_heaps(list, memory_heap);
         let root = p.root.as_raw() as usize;
+        assert!(root != 0, "host root signature handle is null");
+        assert!(!p.pso.as_raw().is_null(), "host pipeline handle is null");
         if self.host_roots[usize::from(compute)] != root {
             // SAFETY: an open list and a live root signature.
             unsafe {
@@ -1100,15 +1107,21 @@ impl State {
             dropped(list, self.pipeline, "dispatch");
             return;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            once!(
-                pipeline = format_args!("{:#x}", self.pipeline),
-                "a dispatch without a host pipeline dropped"
-            );
-            DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
-            dropped(list, self.pipeline, "dispatch");
-            return;
+        let p = match crate::pipeline::host_pipeline(self.pipeline as This) {
+            Some(p) => p,
+            None => match crate::pipeline::fallback_pipeline(self.pipeline as This, true) {
+                Some(p) => p,
+                None => {
+                    once!(
+                        pipeline = format_args!("{:#x}", self.pipeline),
+                        "a dispatch without a host pipeline dropped"
+                    );
+                    DROPPED.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    dropped(list, self.pipeline, "dispatch");
+                    return;
+                }
+            },
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
@@ -1120,6 +1133,7 @@ impl State {
             dropped(list, self.pipeline, "dispatch");
             return;
         }
+        assert_ne!(self.host_pipeline, 0, "null host pipeline before Dispatch");
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
@@ -1571,6 +1585,7 @@ impl State {
                 false
             });
         if ran {
+            assert_ne!(self.host_pipeline, 0, "null host pipeline before DrawInstanced");
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
                 (vertices / 3 * 6, 0)
@@ -1673,6 +1688,7 @@ impl State {
         }
         let ran = !rects && self.prepare(list, true);
         if ran {
+            assert_ne!(self.host_pipeline, 0, "null host pipeline before DrawIndexedInstanced");
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
             // SAFETY: an open list with everything set.
@@ -1801,6 +1817,7 @@ impl State {
             }
             return false;
         }
+        assert_ne!(self.host_pipeline, 0, "null host pipeline before ExecuteIndirect");
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)

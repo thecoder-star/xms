@@ -1581,6 +1581,19 @@ fn evictable(t: &HostTexture) -> bool {
     t.key.is_some() && crate::texture::title_written(&t.texture) && !t.host_written.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+#[cfg(windows)]
+fn effective_vram_budget_mb(dxgi_budget_mb: f64) -> f64 {
+    let arena_mb = crate::host::vram_arena_budget_bytes() as f64 / 1e6;
+    let is_small_vram = crate::host::host()
+        .and_then(|h| h.dedicated_vram_bytes())
+        .is_some_and(|b| b <= 4600 << 20);
+    if crate::host::vram_arena_explicit() || is_small_vram {
+        dxgi_budget_mb.min(arena_mb)
+    } else {
+        dxgi_budget_mb
+    }
+}
+
 /// Once per presented frame, before a submission (`Host::execute`, one at a
 /// time, the last one has run): gives up host textures fed from title memory
 /// that the title has not used for [`IDLE_MS`], and past [`BUDGET_HIGH`] of
@@ -1594,10 +1607,19 @@ pub(crate) fn evict_unused() {
         return;
     }
     let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
+        let budget = effective_vram_budget_mb(budget);
         // Free space in the heaps of textures takes the card's memory but
         // is not in use: new textures go there first.
-        let used = used - crate::placement::free_bytes() as f64 / 1e6;
-        if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
+        let mut used = (used - crate::placement::free_bytes() as f64 / 1e6).max(0.0);
+        if used > BUDGET_HIGH * budget {
+            let freed = crate::placement::release_spare() as f64 / 1e6;
+            used = (used - freed).max(0.0);
+        }
+        if used > BUDGET_HIGH * budget {
+            ((used - BUDGET_LOW * budget) * 1e6) as u64
+        } else {
+            0
+        }
     });
     evict(frame, now_ms(), over);
 }

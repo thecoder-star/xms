@@ -256,6 +256,36 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+#[cfg(windows)]
+fn fallback_pipelines_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| crate::switch::on_or_default("VICTORY_FALLBACK_PIPELINES", true))
+}
+
+/// A valid no-op host pipeline when `this` has no compiled host pipeline yet
+/// (warming or refused), never for skipped pipelines or mesh shaders.
+#[cfg(windows)]
+pub(crate) fn fallback_pipeline<'a>(this: This, compute: bool) -> Option<&'a host::HostPipeline> {
+    if this.is_null() || !fallback_pipelines_enabled() {
+        return None;
+    }
+    #[cfg(feature = "diagnostics")]
+    if is_skipped(this) {
+        return None;
+    }
+    let p = pipeline(this);
+    if compute {
+        if p.shaders.iter().any(|s| s.stage == "compute") || p.shaders.is_empty() {
+            return host::fallback_compute();
+        }
+        return None;
+    }
+    if p.shaders.iter().any(|s| s.stage == "mesh") {
+        return None;
+    }
+    p.host.graphics.as_deref().and_then(host::fallback_graphics)
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {

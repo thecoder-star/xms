@@ -115,22 +115,24 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
+fn pool_bytes_for(arena_budget_bytes: u64) -> usize {
+    (arena_budget_bytes as usize / 4).clamp(64 << 20, 512 << 20)
+}
+
 /// Returns a snapshot buffer to the pool, which keeps the largest up to
-/// [`POOL_BYTES`] in all: a world submission snapshots several copies, and
+/// [`pool_bytes_for`] in all: a world submission snapshots several copies, and
 /// fresh buffers cost a page fault per 4 KiB touched (millions per frame).
 fn give_back(v: Vec<u8>) {
+    let limit = pool_bytes_for(crate::host::vram_arena_budget_bytes());
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     let mut total = 0;
     pool.retain(|v| {
         total += v.capacity();
-        total <= POOL_BYTES
+        total <= limit
     });
 }
-
-/// Snapshot memory kept for reuse.
-const POOL_BYTES: usize = 512 << 20;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
@@ -1121,9 +1123,7 @@ pub(crate) fn log_views(frames: f64) {
         .count();
     let (chunks, held) = {
         let a = arena();
-        // SAFETY: live buffers.
-        let size = |c: &(ID3D12Resource, usize, u64, BTreeMap<u64, u64>)| unsafe { c.0.GetDesc() }.Width;
-        let held: u64 = a.chunks.iter().map(|c| size(c) - c.3.values().sum::<u64>()).sum();
+        let held: u64 = a.chunks.iter().map(|c| c.size - c.free.values().sum::<u64>()).sum();
         (a.chunks.len(), held)
     };
     if asks > 0 {
@@ -1171,13 +1171,22 @@ fn exact(address: u64, len: u64, element: u64) -> Option<Arc<Shadow>> {
     Some(shadow)
 }
 
-/// A run of an [`Arena`] buffer: the buffer, where the run starts, its
+/// A run of an [`Arena`] buffer: the chunk id, where the run starts, its
 /// bytes.
 #[derive(Clone, Copy)]
 struct Slice {
-    chunk: usize,
+    chunk: u64,
     offset: u64,
     len: u64,
+}
+
+struct ArenaChunk {
+    id: u64,
+    buffer: ID3D12Resource,
+    data: usize,
+    gpu: u64,
+    size: u64,
+    free: BTreeMap<u64, u64>,
 }
 
 /// Shared buffers for the copies of single views ([`exact`]): they are
@@ -1187,21 +1196,51 @@ struct Slice {
 /// of memory each (~5,000 live).
 #[derive(Default)]
 struct Arena {
-    /// Each buffer, its mapping and host address, and its free runs
-    /// (offset → bytes).
-    chunks: Vec<(ID3D12Resource, usize, u64, BTreeMap<u64, u64>)>,
+    chunks: Vec<ArenaChunk>,
+    next_id: u64,
+    allocated_bytes: u64,
+    warned_over_budget: bool,
 }
 
 /// Bytes of each arena buffer (a larger copy gets one of its size).
 const CHUNK: u64 = 16 << 20;
 
-static ARENA: Mutex<Arena> = Mutex::new(Arena { chunks: Vec::new() });
+static ARENA: Mutex<Arena> = Mutex::new(Arena {
+    chunks: Vec::new(),
+    next_id: 0,
+    allocated_bytes: 0,
+    warned_over_budget: false,
+});
 
 fn arena() -> std::sync::MutexGuard<'static, Arena> {
     ARENA.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+impl ArenaChunk {
+    fn is_empty(&self) -> bool {
+        self.free.get(&0) == Some(&self.size)
+    }
+}
+
 impl Arena {
+    /// Drops completely free chunks past `keep_spare` to bound memory use.
+    fn reclaim_empty(&mut self, keep_spare: usize) {
+        let mut spare = 0usize;
+        let mut freed = 0u64;
+        self.chunks.retain(|chunk| {
+            if !chunk.is_empty() {
+                return true;
+            }
+            spare += 1;
+            if spare <= keep_spare {
+                return true;
+            }
+            freed += chunk.size;
+            false
+        });
+        self.allocated_bytes = self.allocated_bytes.saturating_sub(freed);
+    }
+
     /// A run of `len` bytes starting at a multiple of `element` (and of 256)
     /// in a shared buffer: the buffer, the run's mapping and host address.
     fn take(&mut self, len: u64, element: u64) -> Option<(ID3D12Resource, *mut u8, u64, Slice)> {
@@ -1219,48 +1258,97 @@ impl Arena {
                 (start + len <= at + n).then_some((at, n, start))
             })
         };
-        let found = self.chunks.iter().enumerate().find_map(|(c, chunk)| fits(&chunk.3).map(|f| (c, f)));
-        let (chunk, (at, n, start)) = match found {
+        let found = self
+            .chunks
+            .iter()
+            .enumerate()
+            .find_map(|(c, chunk)| fits(&chunk.free).map(|f| (c, f)));
+        let (chunk_idx, (at, n, start)) = match found {
             Some(found) => found,
             None => {
+                let budget = crate::host::vram_arena_budget_bytes();
                 let size = CHUNK.max((len + align).next_multiple_of(1 << 16));
+                if self.allocated_bytes.saturating_add(size) > budget {
+                    self.reclaim_empty(0);
+                    if self.allocated_bytes.saturating_add(size) > budget && !self.warned_over_budget {
+                        self.warned_over_budget = true;
+                        tracing::warn!(
+                            allocated_mb = self.allocated_bytes >> 20,
+                            budget_mb = budget >> 20,
+                            "shadow arena exceeded VICTORY_VRAM_ARENA_MB budget"
+                        );
+                    }
+                }
                 let (buffer, data) = host()?.shared_buffer(size)?;
                 crate::host::name(&buffer, || format!("title views {size:#x}"));
                 // SAFETY: a live buffer.
                 let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                let id = self.next_id;
+                self.next_id += 1;
+                self.allocated_bytes = self.allocated_bytes.saturating_add(size);
                 let free = BTreeMap::from([(0, size)]);
-                self.chunks.push((buffer, data as usize, gpu, free));
+                self.chunks.push(ArenaChunk {
+                    id,
+                    buffer,
+                    data: data as usize,
+                    gpu,
+                    size,
+                    free,
+                });
                 let c = self.chunks.len() - 1;
-                (c, fits(&self.chunks[c].3)?)
+                (c, fits(&self.chunks[c].free)?)
             }
         };
-        let (buffer, data, gpu, free) = &mut self.chunks[chunk];
-        free.remove(&at);
+        let chunk = &mut self.chunks[chunk_idx];
+        chunk.free.remove(&at);
         if start > at {
-            free.insert(at, start - at);
+            chunk.free.insert(at, start - at);
         }
         if at + n > start + len {
-            free.insert(start + len, at + n - start - len);
+            chunk.free.insert(start + len, at + n - start - len);
         }
-        let slice = Slice { chunk, offset: start, len };
-        Some((buffer.clone(), (*data + start as usize) as *mut u8, *gpu + start, slice))
+        let slice = Slice {
+            chunk: chunk.id,
+            offset: start,
+            len,
+        };
+        Some((
+            chunk.buffer.clone(),
+            (chunk.data + start as usize) as *mut u8,
+            chunk.gpu + start,
+            slice,
+        ))
     }
 
     /// A run goes back, joined to its free neighbours.
     fn give_back(&mut self, slice: Slice) {
-        let Some((_, _, _, free)) = self.chunks.get_mut(slice.chunk) else { return };
+        let Some(chunk) = self.chunks.iter_mut().find(|c| c.id == slice.chunk) else {
+            return;
+        };
         let (mut at, mut n) = (slice.offset, slice.len);
-        if let Some((&before, &m)) = free.range(..at).next_back()
+        if let Some((&before, &m)) = chunk.free.range(..at).next_back()
             && before + m == at
         {
-            free.remove(&before);
+            chunk.free.remove(&before);
             (at, n) = (before, n + m);
         }
-        if let Some(m) = free.remove(&(at + n)) {
+        if let Some(m) = chunk.free.remove(&(at + n)) {
             n += m;
         }
-        free.insert(at, n);
+        chunk.free.insert(at, n);
+        if chunk.is_empty() {
+            let budget = crate::host::vram_arena_budget_bytes();
+            let keep = usize::from(self.allocated_bytes <= budget);
+            self.reclaim_empty(keep);
+        }
     }
+}
+
+#[test]
+fn pool_bytes_scales_with_arena_budget_and_clamps() {
+    assert_eq!(pool_bytes_for(1228 << 20), (1228 << 20) / 4);
+    assert_eq!(pool_bytes_for(64 << 20), 64 << 20);
+    assert_eq!(pool_bytes_for(4096 << 20), 512 << 20);
 }
 
 /// Every host copy of title memory made so far (buffers and windows).
@@ -1434,7 +1522,7 @@ pub(crate) mod tests {
             arena.give_back(s);
         }
         assert_eq!(arena.chunks.len(), 1);
-        assert_eq!(arena.chunks[0].3.len(), 1, "one free run again");
+        assert_eq!(arena.chunks[0].free.len(), 1, "one free run again");
         // Larger than a buffer: one of its own.
         let (_, _, _, d) = arena.take(CHUNK + 1, 4).unwrap();
         assert_eq!((arena.chunks.len(), d.chunk), (2, 1));

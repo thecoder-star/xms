@@ -10,14 +10,29 @@ fn value_is_on(value: Option<&OsStr>) -> bool {
     value.is_some_and(|v| v != "0")
 }
 
+/// Whether a switch is on when unset falls back to `default`.
+fn value_is_on_or_default(value: Option<&OsStr>, default: bool) -> bool {
+    match value {
+        Some(v) => v != "0",
+        None => default,
+    }
+}
+
 /// Whether the environment variable `name` switches something on.
 pub(crate) fn on(name: &str) -> bool {
     value_is_on(std::env::var_os(name).as_deref())
 }
 
+/// Whether the environment variable `name` switches something on, using
+/// `default` when the variable is unset.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn on_or_default(name: &str, default: bool) -> bool {
+    value_is_on_or_default(std::env::var_os(name).as_deref(), default)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::value_is_on;
+    use super::{value_is_on, value_is_on_or_default};
     use std::ffi::OsStr;
 
     #[test]
@@ -41,5 +56,13 @@ mod tests {
         for value in ["", "true", "yes", "2", "00", " 0", "0 "] {
             assert!(value_is_on(Some(OsStr::new(value))), "{value:?}");
         }
+    }
+
+    #[test]
+    fn default_enabled_switch_respects_explicit_zero() {
+        assert!(value_is_on_or_default(None, true));
+        assert!(!value_is_on_or_default(None, false));
+        assert!(!value_is_on_or_default(Some(OsStr::new("0")), true));
+        assert!(value_is_on_or_default(Some(OsStr::new("1")), false));
     }
 }

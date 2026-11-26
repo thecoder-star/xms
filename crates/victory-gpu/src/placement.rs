@@ -98,9 +98,9 @@ fn last_holder(resource: &ID3D12Resource) -> bool {
 }
 
 impl Heaps {
-    /// Frees the pending ranges nothing else holds now, and releases empty
-    /// heaps past [`SPARE`].
-    fn reap(&mut self) {
+    /// Frees pending ranges nothing else holds now, and releases empty heaps
+    /// past `max_spare`. Returns the number of heaps released.
+    fn reap_with_spare(&mut self, max_spare: usize) -> usize {
         let mut i = 0;
         while i < self.pending.len() {
             if last_holder(&self.pending[i].0) {
@@ -113,14 +113,22 @@ impl Heaps {
             }
         }
         let empty = |h: &Heap| h.free.get(&0) == Some(&HEAP);
+        let before = self.heaps.len();
         let mut spare = 0;
         self.heaps.retain(|h| {
             if !empty(h) {
                 return true;
             }
             spare += 1;
-            spare <= SPARE
+            spare <= max_spare
         });
+        before - self.heaps.len()
+    }
+
+    /// Frees the pending ranges nothing else holds now, and releases empty
+    /// heaps past [`SPARE`].
+    fn reap(&mut self) {
+        self.reap_with_spare(SPARE);
     }
 
     /// A range of `size` bytes: in a heap with room, else in a new heap.
@@ -203,6 +211,14 @@ pub(crate) fn free_bytes() -> u64 {
     let Some(h) = heaps.as_mut() else { return 0 };
     h.reap();
     h.heaps.iter().flat_map(|h| h.free.values()).sum()
+}
+
+/// Releases all completely empty placement heaps under VRAM pressure, returning
+/// the bytes freed back to D3D12.
+pub(crate) fn release_spare() -> u64 {
+    let mut heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(h) = heaps.as_mut() else { return 0 };
+    h.reap_with_spare(0) as u64 * HEAP
 }
 
 /// Heaps of textures held, and their used and free bytes (after freeing

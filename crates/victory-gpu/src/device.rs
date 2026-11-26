@@ -276,6 +276,11 @@ extern "system" fn check_feature_support(
     const SHADER_MODEL: u32 = 7;
     const OPTIONS1: u32 = 8;
     const OPTIONS4: u32 = 23;
+    const OPTIONS5: u32 = 27;
+    const OPTIONS6: u32 = 30;
+    const OPTIONS7: u32 = 32;
+    const OPTIONS9: u32 = 37;
+    const OPTIONS11: u32 = 40;
     let expected = match feature {
         OPTIONS_QUERY => size_of_val(&OPTIONS),
         ARCHITECTURE => 16,
@@ -285,6 +290,11 @@ extern "system" fn check_feature_support(
         SHADER_MODEL => 4,
         OPTIONS1 => 24,
         OPTIONS4 => 12,
+        OPTIONS5 => 12,
+        OPTIONS6 => 20,
+        OPTIONS7 => 8,
+        OPTIONS9 => 24,
+        OPTIONS11 => 4,
         _ => {
             tracing::warn!(feature, size, "device feature query not implemented");
             return E_NOTIMPL;
@@ -347,9 +357,70 @@ extern "system" fn check_feature_support(
             unsafe { data.cast::<[u32; 3]>().write_unaligned([0, 0, 1]) };
             S_OK
         }
+        OPTIONS5 => {
+            #[cfg(windows)]
+            let render_passes = crate::host::host().map_or(0, |h| h.caps.render_pass_tier);
+            #[cfg(not(windows))]
+            let render_passes = 0;
+            // SAFETY: checked size (12 bytes) and non-null. Raytracing disabled on host path.
+            unsafe {
+                data.cast::<[u32; 3]>()
+                    .write_unaligned([1, render_passes, 0])
+            };
+            S_OK
+        }
+        OPTIONS6 => {
+            // SAFETY: checked size (20 bytes) and non-null. Fixed 1x1 shading rate (VRS tier 0).
+            unsafe { data.cast::<[u32; 5]>().write_unaligned([0; 5]) };
+            S_OK
+        }
+        OPTIONS7 => {
+            #[cfg(windows)]
+            let mesh_tier = crate::host::host()
+                .filter(|h| h.mesh_shaders())
+                .map_or(0, |h| h.caps.mesh_tier);
+            #[cfg(not(windows))]
+            let mesh_tier = 0;
+            // SAFETY: checked size (8 bytes) and non-null. Sampler feedback unsupported.
+            unsafe { data.cast::<[u32; 2]>().write_unaligned([mesh_tier, 0]) };
+            S_OK
+        }
+        OPTIONS9 => {
+            #[cfg(windows)]
+            let int64_typed =
+                u32::from(crate::host::host().is_some_and(|h| h.caps.int64_typed_atomics));
+            #[cfg(not(windows))]
+            let int64_typed = 0;
+            // SAFETY: checked size (24 bytes) and non-null.
+            unsafe {
+                data.cast::<[u32; 6]>()
+                    .write_unaligned([0, 0, int64_typed, 0, 0, 0])
+            };
+            S_OK
+        }
+        OPTIONS11 => {
+            #[cfg(windows)]
+            let int64_heap =
+                u32::from(crate::host::host().is_some_and(|h| h.caps.int64_heap_atomics));
+            #[cfg(not(windows))]
+            let int64_heap = 0;
+            // SAFETY: checked size (4 bytes) and non-null.
+            unsafe { data.cast::<u32>().write_unaligned(int64_heap) };
+            S_OK
+        }
         _ => feature_levels(data),
     }
 }
+
+#[cfg(windows)]
+const _: () = {
+    use windows::Win32::Graphics::Direct3D12::*;
+    assert!(size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS5>() == 12);
+    assert!(size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS6>() == 20);
+    assert!(size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS7>() == 8);
+    assert!(size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS9>() == 24);
+    assert!(size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS11>() == 4);
+};
 
 fn feature_levels(data: *mut c_void) -> HRESULT {
     // SAFETY: the caller checked size and non-null.
@@ -592,6 +663,27 @@ mod tests {
             check(device, 8, waves.as_mut_ptr().cast(), 16),
             E_INVALIDARG
         );
+    }
+
+    #[test]
+    fn options5_through_11_report_safe_capabilities() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+        let mut o5 = [u32::MAX; 3];
+        assert_eq!(check(device, 27, o5.as_mut_ptr().cast(), 12), S_OK);
+        assert_eq!(o5[2], 0, "raytracing disabled");
+        let mut o6 = [u32::MAX; 5];
+        assert_eq!(check(device, 30, o6.as_mut_ptr().cast(), 20), S_OK);
+        assert_eq!(o6, [0; 5], "VRS tier 0 fixed 1x1");
+        let mut o7 = [u32::MAX; 2];
+        assert_eq!(check(device, 32, o7.as_mut_ptr().cast(), 8), S_OK);
+        assert_eq!(o7[1], 0, "sampler feedback disabled");
+        let mut o9 = [u32::MAX; 6];
+        assert_eq!(check(device, 37, o9.as_mut_ptr().cast(), 24), S_OK);
+        let mut o11 = u32::MAX;
+        assert_eq!(check(device, 40, (&raw mut o11).cast(), 4), S_OK);
+        assert_eq!(check(device, 30, o6.as_mut_ptr().cast(), 16), E_INVALIDARG);
     }
 
     #[test]

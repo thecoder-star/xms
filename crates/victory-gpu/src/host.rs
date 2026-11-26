@@ -39,9 +39,35 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
 
+#[derive(Debug, Clone)]
+pub(crate) struct AdapterInfo {
+    pub(crate) vendor_id: u32,
+    pub(crate) device_id: u32,
+    pub(crate) dedicated_vram_bytes: u64,
+    pub(crate) description: String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct HostCapabilities {
+    pub(crate) wave_ops: bool,
+    pub(crate) wave_lane_min: u32,
+    pub(crate) wave_lane_max: u32,
+    pub(crate) render_pass_tier: u32,
+    pub(crate) raytracing_tier: u32,
+    pub(crate) vrs_tier: u32,
+    pub(crate) vrs_tile_size: u32,
+    pub(crate) mesh_tier: u32,
+    pub(crate) sampler_feedback_tier: u32,
+    pub(crate) highest_shader_model: u32,
+    pub(crate) int64_typed_atomics: bool,
+    pub(crate) int64_heap_atomics: bool,
+}
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
+    pub(crate) adapter: Option<AdapterInfo>,
+    pub(crate) caps: HostCapabilities,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -235,7 +261,32 @@ fn create() -> windows::core::Result<Host> {
             })?;
         let cpu_view_size =
             device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        tracing::info!("host D3D12 device ready");
+        let adapter = query_adapter_info(&device);
+        let caps = query_capabilities(&device);
+        if let Some(info) = &adapter {
+            tracing::info!(
+                adapter = %info.description,
+                vendor = format_args!("{:#06x}", info.vendor_id),
+                device = format_args!("{:#06x}", info.device_id),
+                vram_mb = info.dedicated_vram_bytes >> 20,
+                wave_ops = caps.wave_ops,
+                wave_lanes = format_args!("{}..={}", caps.wave_lane_min, caps.wave_lane_max),
+                shader_model = format_args!("{:#x}", caps.highest_shader_model),
+                mesh_tier = caps.mesh_tier,
+                raytracing_tier = caps.raytracing_tier,
+                vrs_tier = caps.vrs_tier,
+                atomics64 = caps.int64_typed_atomics && caps.int64_heap_atomics,
+                "host D3D12 device ready"
+            );
+            if info.vendor_id == 0x10de && caps.wave_lane_max > 0 && caps.wave_lane_max < 64 {
+                tracing::info!(
+                    mesh_shaders = caps.mesh_tier != 0,
+                    "NVIDIA wave32 adapter detected; wave64-only shaders and unsupported stages will be refused safely"
+                );
+            }
+        } else {
+            tracing::info!("host D3D12 device ready");
+        }
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
         // host chooses (the RX 6700 XT does, WARP does not).
@@ -250,6 +301,8 @@ fn create() -> windows::core::Result<Host> {
         Ok(Host {
             device,
             depth_bounds_supported,
+            adapter,
+            caps,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -267,6 +320,166 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(Presentation::default()),
         })
     }
+}
+
+/// Queries DXGI adapter metadata for `device`.
+fn query_adapter_info(device: &ID3D12Device) -> Option<AdapterInfo> {
+    // SAFETY: plain device and DXGI adapter queries.
+    unsafe {
+        let luid = device.GetAdapterLuid();
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(luid).ok()?;
+        let desc = adapter.GetDesc1().ok()?;
+        let end = desc
+            .Description
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(desc.Description.len());
+        let description = String::from_utf16_lossy(&desc.Description[..end]);
+        Some(AdapterInfo {
+            vendor_id: desc.VendorId,
+            device_id: desc.DeviceId,
+            dedicated_vram_bytes: desc.DedicatedVideoMemory as u64,
+            description,
+        })
+    }
+}
+
+/// Queries host GPU capabilities once at device creation.
+fn query_capabilities(device: &ID3D12Device) -> HostCapabilities {
+    let mut caps = HostCapabilities::default();
+    let mut options1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: valid sized output buffer for D3D12 feature query.
+    if unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut options1).cast(),
+            size_of_val(&options1) as u32,
+        )
+    }
+    .is_ok()
+    {
+        caps.wave_ops = options1.WaveOps.as_bool();
+        caps.wave_lane_min = options1.WaveLaneCountMin;
+        caps.wave_lane_max = options1.WaveLaneCountMax;
+    }
+    let mut options5 = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+    // SAFETY: valid sized output buffer for D3D12 feature query.
+    if unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS5,
+            (&raw mut options5).cast(),
+            size_of_val(&options5) as u32,
+        )
+    }
+    .is_ok()
+    {
+        caps.render_pass_tier = options5.RenderPassesTier.0 as u32;
+        caps.raytracing_tier = options5.RaytracingTier.0 as u32;
+    }
+    let mut options6 = D3D12_FEATURE_DATA_D3D12_OPTIONS6::default();
+    // SAFETY: valid sized output buffer for D3D12 feature query.
+    if unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS6,
+            (&raw mut options6).cast(),
+            size_of_val(&options6) as u32,
+        )
+    }
+    .is_ok()
+    {
+        caps.vrs_tier = options6.VariableShadingRateTier.0 as u32;
+        caps.vrs_tile_size = options6.ShadingRateImageTileSize;
+    }
+    let mut options7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+    // SAFETY: valid sized output buffer for D3D12 feature query.
+    if unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS7,
+            (&raw mut options7).cast(),
+            size_of_val(&options7) as u32,
+        )
+    }
+    .is_ok()
+    {
+        caps.mesh_tier = options7.MeshShaderTier.0 as u32;
+        caps.sampler_feedback_tier = options7.SamplerFeedbackTier.0 as u32;
+    }
+    let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+        HighestShaderModel: D3D_SHADER_MODEL_6_6,
+    };
+    // SAFETY: valid sized output buffer for D3D12 feature query.
+    if unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_SHADER_MODEL,
+            (&raw mut model).cast(),
+            size_of_val(&model) as u32,
+        )
+    }
+    .is_ok()
+    {
+        caps.highest_shader_model = model.HighestShaderModel.0 as u32;
+    }
+    let mut options9 = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+    // SAFETY: valid sized output buffer for D3D12 feature query.
+    if unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS9,
+            (&raw mut options9).cast(),
+            size_of_val(&options9) as u32,
+        )
+    }
+    .is_ok()
+    {
+        caps.int64_typed_atomics = options9.AtomicInt64OnTypedResourceSupported.as_bool();
+    }
+    let mut options11 = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
+    // SAFETY: valid sized output buffer for D3D12 feature query.
+    if unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS11,
+            (&raw mut options11).cast(),
+            size_of_val(&options11) as u32,
+        )
+    }
+    .is_ok()
+    {
+        caps.int64_heap_atomics = options11.AtomicInt64OnDescriptorHeapResourceSupported.as_bool();
+    }
+    caps
+}
+
+/// Default shadow / VRAM arena budget in MiB (fits 4 GB GPUs comfortably).
+const DEFAULT_VRAM_ARENA_MB: u64 = 1228;
+
+/// Parses `VICTORY_VRAM_ARENA_MB`, returning bytes.
+pub(crate) fn parse_vram_arena_mb(value: Option<&str>) -> u64 {
+    let mb = match value {
+        None => DEFAULT_VRAM_ARENA_MB,
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(mb) => mb.clamp(64, 65536),
+            Err(_) => {
+                tracing::warn!(value = raw, "invalid VICTORY_VRAM_ARENA_MB; using default");
+                DEFAULT_VRAM_ARENA_MB
+            }
+        },
+    };
+    mb << 20
+}
+
+/// Configured VRAM/shadow arena budget in bytes (`VICTORY_VRAM_ARENA_MB`,
+/// defaulting to 1228 MiB / ~1.2 GiB).
+pub(crate) fn vram_arena_budget_bytes() -> u64 {
+    static BUDGET: OnceLock<u64> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let env = std::env::var("VICTORY_VRAM_ARENA_MB").ok();
+        parse_vram_arena_mb(env.as_deref())
+    })
+}
+
+/// Whether `VICTORY_VRAM_ARENA_MB` was explicitly set by the user.
+pub(crate) fn vram_arena_explicit() -> bool {
+    std::env::var_os("VICTORY_VRAM_ARENA_MB").is_some()
 }
 
 /// Diagnostics: our process's private commit and working set, bytes.
@@ -426,6 +639,14 @@ pub(crate) mod tests {
         let recovered = start + Duration::from_secs(2);
         assert_eq!(retry.attempt(recovered, || Ok::<_, ()>(42)), Some(Ok(42)));
         assert_eq!(retry.attempt(recovered, || Ok::<_, ()>(43)), Some(Ok(43)));
+    }
+
+    #[test]
+    fn vram_arena_mb_parser_uses_default_and_clamps_bounds() {
+        assert_eq!(super::parse_vram_arena_mb(None), 1228 << 20);
+        assert_eq!(super::parse_vram_arena_mb(Some("2048")), 2048 << 20);
+        assert_eq!(super::parse_vram_arena_mb(Some(" 16 ")), 64 << 20);
+        assert_eq!(super::parse_vram_arena_mb(Some("bad")), 1228 << 20);
     }
 
     use super::*;
@@ -1033,36 +1254,30 @@ struct Deferred {
 }
 
 impl Host {
+    /// Host GPU wave lane range `(min, max)`.
+    pub(crate) fn wave_lanes(&self) -> (u32, u32) {
+        if self.caps.wave_ops && self.caps.wave_lane_max > 0 {
+            (self.caps.wave_lane_min, self.caps.wave_lane_max)
+        } else {
+            (32, 32)
+        }
+    }
+
+    /// Host GPU dedicated VRAM in bytes, if reported by DXGI.
+    pub(crate) fn dedicated_vram_bytes(&self) -> Option<u64> {
+        self.adapter
+            .as_ref()
+            .map(|a| a.dedicated_vram_bytes)
+            .filter(|&b| b > 0)
+    }
+
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {
         static MESH: OnceLock<bool> = OnceLock::new();
         *MESH.get_or_init(|| {
-            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
-            let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
-                HighestShaderModel: D3D_SHADER_MODEL_6_6,
-            };
-            // SAFETY: each query writes its own structure of the given size.
-            let ok = unsafe {
-                self.device
-                    .CheckFeatureSupport(
-                        D3D12_FEATURE_D3D12_OPTIONS7,
-                        (&raw mut options).cast(),
-                        size_of_val(&options) as u32,
-                    )
-                    .is_ok()
-                    && self
-                        .device
-                        .CheckFeatureSupport(
-                            D3D12_FEATURE_SHADER_MODEL,
-                            (&raw mut model).cast(),
-                            size_of_val(&model) as u32,
-                        )
-                        .is_ok()
-            };
-            let mesh = ok
-                && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
-                && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
+            let mesh = self.caps.mesh_tier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED.0 as u32
+                && self.caps.highest_shader_model >= D3D_SHADER_MODEL_6_6.0 as u32;
             tracing::info!(mesh, "host mesh shader support");
             mesh
         })
@@ -1073,29 +1288,7 @@ impl Host {
     pub(crate) fn heap_atomics64(&self) -> bool {
         static ATOMICS: OnceLock<bool> = OnceLock::new();
         *ATOMICS.get_or_init(|| {
-            let mut typed = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
-            let mut heap = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
-            // SAFETY: each query writes its own structure of the given size.
-            let ok = unsafe {
-                self.device
-                    .CheckFeatureSupport(
-                        D3D12_FEATURE_D3D12_OPTIONS9,
-                        (&raw mut typed).cast(),
-                        size_of_val(&typed) as u32,
-                    )
-                    .is_ok()
-                    && self
-                        .device
-                        .CheckFeatureSupport(
-                            D3D12_FEATURE_D3D12_OPTIONS11,
-                            (&raw mut heap).cast(),
-                            size_of_val(&heap) as u32,
-                        )
-                        .is_ok()
-            };
-            let atomics = ok
-                && typed.AtomicInt64OnTypedResourceSupported.as_bool()
-                && heap.AtomicInt64OnDescriptorHeapResourceSupported.as_bool();
+            let atomics = self.caps.int64_typed_atomics && self.caps.int64_heap_atomics;
             tracing::info!(atomics, "host 64-bit atomics on typed heap resources");
             atomics
         })

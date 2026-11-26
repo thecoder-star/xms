@@ -177,8 +177,32 @@ fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
-const BUDGET: Duration = Duration::from_millis(500);
+/// Default waiting allowed per title frame, over all threads: small enough
+/// to keep 30 fps UI/menu loops responsive while workers compile in background.
+const DEFAULT_BUDGET_MS: u64 = 4;
+
+fn parse_budget_ms(value: Option<&str>) -> Duration {
+    let ms = match value {
+        None => DEFAULT_BUDGET_MS,
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(ms) => ms.min(60_000),
+            Err(_) => {
+                tracing::warn!(value = raw, "invalid VICTORY_PIPELINE_BUDGET_MS; using default");
+                DEFAULT_BUDGET_MS
+            }
+        },
+    };
+    Duration::from_millis(ms)
+}
+
+/// Waiting allowed per title frame, over all threads (`VICTORY_PIPELINE_BUDGET_MS`).
+fn frame_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let env = std::env::var("VICTORY_PIPELINE_BUDGET_MS").ok();
+        parse_budget_ms(env.as_deref())
+    })
+}
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -240,7 +264,10 @@ fn wait(p: &Pending, frame: u64) {
     if FRAME.swap(frame, Ordering::Relaxed) != frame {
         WAITED_US.store(0, Ordering::Relaxed);
     }
-    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    let left = frame_budget().saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    if left.is_zero() {
+        return;
+    }
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -431,5 +458,14 @@ mod tests {
         assert!(matches!(cold.made.get(), Some(None)));
         assert!(matches!(warm.made.get(), Some(None)));
         assert!(shader.translated.get().is_none());
+    }
+
+    #[test]
+    fn pipeline_budget_parser_defaults_and_clamps() {
+        assert_eq!(parse_budget_ms(None), Duration::from_millis(DEFAULT_BUDGET_MS));
+        assert_eq!(parse_budget_ms(Some("0")), Duration::from_millis(0));
+        assert_eq!(parse_budget_ms(Some(" 16 ")), Duration::from_millis(16));
+        assert_eq!(parse_budget_ms(Some("999999")), Duration::from_millis(60_000));
+        assert_eq!(parse_budget_ms(Some("bad")), Duration::from_millis(DEFAULT_BUDGET_MS));
     }
 }

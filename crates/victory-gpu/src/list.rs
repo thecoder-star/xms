@@ -1791,13 +1791,14 @@ const METHODS: [(usize, *const ()); 52] = [
     (127, state::dispatch_mesh as *const ()),     // 0x3f8 mesh dispatch
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
-const MORE_METHODS: [(usize, *const ()); 12] = [
+const MORE_METHODS: [(usize, *const ()); 13] = [
     (53, state::clear_unordered_uint as *const ()), // 0x1a8
     (54, state::clear_unordered_float as *const ()), // 0x1b0
     (55, ignored_state as *const ()),               // 0x1b8 DiscardResource
     (28, query_mark as *const ()),                  // 0xe0 BeginQuery
     (29, query_mark as *const ()),                  // 0xe8 EndQuery
     (30, resolve_queries as *const ()),             // 0xf0
+    (31, ignored_state as *const ()),               // 0xf8 SetPredication
     (78, dispatch_x as *const ()),                  // 0x270
     (98, state::dispatch_mesh_x as *const ()),      // 0x310
     (99, driver_hint as *const ()),                 // 0x318
